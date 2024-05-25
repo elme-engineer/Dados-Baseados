@@ -5,7 +5,9 @@ import psycopg2
 import uuid
 import time
 import bcrypt
+import jwt
 from flask import jsonify, request, Flask
+from psycopg2.errors import UniqueViolation
 import hmac, hashlib, base64, json
 from datetime import datetime, timedelta
 
@@ -75,7 +77,7 @@ def generate_token(payload):
     return jwt
 
 
-def descode_token(jwt):
+def decode_token(jwt):
     try:
         b64_header, b64_payload, b64_signature = jwt.split('.')
 
@@ -115,7 +117,7 @@ def autenticate_user():
         password = payload["password"]
 
         # Use parameterized queries to prevent SQL injection
-        query = """SELECT person_id, password FROM person WHERE username = %s;"""
+        query = """SELECT id, password FROM person WHERE username = %s;"""
         cur.execute(query, (username,))
         row = cur.fetchone()
 
@@ -166,24 +168,21 @@ def add_person(role):
 
 
     # Generate a unique person_id
-    payload['person_id'] = str(uuid.uuid4())
+    person_id = str(uuid.uuid4())
 
     #encrypt password
 
     password = payload['password'];
-    # Hash password    
-    # Hash password    
+    # Hash password       
     pwd_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-    print(pwd_hash)
 
     # Insert into person table
     person_statement = '''
-        INSERT INTO person (person_id, name, age, username, password, address, phone_number, email)
+        INSERT INTO person (id, name, age, username, password, address, phone_number, email)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     '''
     person_values = (
-        payload['person_id'], payload['name'], int(payload['age']), payload['username'], 
+        person_id, payload['name'], int(payload['age']), payload['username'], 
         pwd_hash, payload['address'], payload['phone_number'], payload['email']
     )
     
@@ -197,8 +196,8 @@ def add_person(role):
                 response = {'status': StatusCodes['client_error'], 'results': 'health_condition missing for patient'}
                 return jsonify(response)
 
-            patient_statement = 'INSERT INTO patient (person_person_id, health_condition) VALUES (%s, %s)'
-            patient_values = (payload['person_id'], payload['health_condition'])
+            patient_statement = 'INSERT INTO patient (person_id, health_condition) VALUES (%s, %s)'
+            patient_values = (person_id, payload['health_condition'])
             cur.execute(patient_statement, patient_values)
 
         else:    #employee 
@@ -208,8 +207,8 @@ def add_person(role):
                 return jsonify(response)
 
         
-            employee_statement = 'INSERT INTO employee (person_person_id, medical_license) VALUES (%s, %s)'
-            employee_values = (payload['person_id'], payload['medical_license'])
+            employee_statement = 'INSERT INTO employee (person_id, medical_license) VALUES (%s, %s)'
+            employee_values = (person_id, payload['medical_license'])
             cur.execute(employee_statement, employee_values)
 
             if role == 'doctor':
@@ -219,8 +218,8 @@ def add_person(role):
 
             
 
-                doctor_statement = 'INSERT INTO doctor (employee_person_person_id, category) VALUES (%s, %s)'
-                doctor_values = (payload['person_id'], payload['category'])
+                doctor_statement = 'INSERT INTO doctor (employee_person_id, category) VALUES (%s, %s)'
+                doctor_values = (person_id, payload['category'])
                 cur.execute(doctor_statement, doctor_values)
 
             if role == 'nurse':
@@ -229,8 +228,8 @@ def add_person(role):
                     return jsonify(response)
 
 
-                nurse_statement = 'INSERT INTO nurse (employee_person_person_id, category) VALUES (%s, %s)'
-                nurse_values = (payload['person_id'], payload['category'])
+                nurse_statement = 'INSERT INTO nurse (employee_person_id, category) VALUES (%s, %s)'
+                nurse_values = (person_id, payload['category'])
                 cur.execute(nurse_statement, nurse_values)
 
 
@@ -240,15 +239,23 @@ def add_person(role):
                     return jsonify(response)
 
     
-                assistant_statement = 'INSERT INTO assistent (employee_person_person_id, area_of_work) VALUES (%s, %s)'
-                assistant_values = (payload['person_id'], payload['area_of_work'])
+                assistant_statement = 'INSERT INTO assistant (employee_person_id, area_of_work) VALUES (%s, %s)'
+                assistant_values = (person_id, payload['area_of_work'])
                 cur.execute(assistant_statement, assistant_values)
 
 
 
         # Commit the transaction
         conn.commit()
-        response = {'status': StatusCodes['success'], 'results': f'Inserted {role} with ID {payload["person_id"]}'}
+        response = {'status': StatusCodes['success'], 'results': f'Inserted {role} with ID {person_id}'}
+
+
+    except UniqueViolation as e: #USERNAME ALREADY EXISTS
+        logger.error(f'POST /register/<role> - error: {e}')
+        response = {'status': StatusCodes['client_error'], 'error': 'Username already exists'}
+
+        # an error occurred, rollback
+        conn.rollback()
 
     except (Exception, psycopg2.DatabaseError) as error:
         logger.error(f'POST /register/<role> - error: {error}')
@@ -256,6 +263,177 @@ def add_person(role):
 
         # an error occurred, rollback
         conn.rollback()
+
+    finally:
+        if conn is not None:
+            conn.close()
+
+    return flask.jsonify(response)
+
+
+@app.route('/dbproj/appointment', methods=['POST'])
+def schedule_appointment():
+
+    logger.info('POST /appointment')
+    payload = flask.request.get_json()
+
+    conn = db_connection()
+    cur = conn.cursor()
+
+    logger.debug(f'POST /appointment - payload: {payload}')
+
+       
+    # Validate payload
+    required_fields = ['doctor_id', 'assistant_id', 'date', 'token']
+    if not all(field in payload for field in required_fields):
+        response = {'status': StatusCodes['client_error'], 'results': 'values missing in payload'}
+        return flask.jsonify(response)
+
+
+    try:
+        
+        #check if doctor exists
+        cur.execute("SELECT * FROM doctor WHERE employee_person_id = %s", (payload['doctor_id'],))
+        doctor = cur.fetchone()
+        if not doctor:
+            if conn is not None:
+                conn.close()
+            return jsonify({'status': StatusCodes['client_error'], 'errors': 'Doctor doesnt exist'}), StatusCodes['client_error']
+
+
+        #check if assistant exists
+        cur.execute("SELECT * FROM assistant WHERE employee_person_id = %s", (payload['assistant_id'],))
+        assistant = cur.fetchone()
+        if not assistant:
+            if conn is not None:
+                conn.close()
+            return jsonify({'status': StatusCodes['client_error'], 'errors': 'Assistant doesnt exist'}), StatusCodes['client_error']
+
+
+        aut_token = decode_token(payload['token'])
+
+        #check if user is a patient
+        cur.execute("SELECT * FROM patient WHERE person_id = %s", (aut_token['user_id'],))
+        patient = cur.fetchone()
+        if not patient:
+            if conn is not None:
+                conn.close()
+            return jsonify({'status': StatusCodes['unauthorized'], 'errors': 'User is not a patient'}), StatusCodes['unauthorized']
+
+
+        cur.execute('SELECT username FROM person WHERE id = %s;', (aut_token['user_id'],))
+        username = cur.fetchall()
+
+        appointment_date = datetime.strptime(payload['date'], '%d-%m-%Y %H:%M:%S')
+
+        # Generate a unique appointment_id and bill_id
+        appointment_id = str(uuid.uuid4())
+
+        bill_id = str(uuid.uuid4())
+
+        appointment_statement = '''
+            INSERT INTO appointment (id, app_date, patient_person_id, billing_id, assistant_employee_person_id, doctor_employee_person_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        '''
+        appointment_values = (appointment_id, appointment_date, aut_token['user_id'], bill_id, payload['assistant_id'], payload['doctor_id'],)
+        
+        cur.execute(appointment_statement, appointment_values)
+
+        conn.commit()
+
+        response = {'status': StatusCodes['success'], 'results': {'appointment_id': appointment_id}}
+        return jsonify(response), StatusCodes['success']
+
+    except jwt.exceptions.InvalidTokenError as error:
+
+        logger.error(f'POST /appointment - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+
+    
+    except ValueError:
+            return jsonify({'status': StatusCodes['client_error'], 'errors': 'Invalid date format. Use DD-MM-YYYY HH:MM:SS'}), StatusCodes['client_error']
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        logger.error(f'POST /appointment - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+
+        conn.rollback()
+
+    except Exception as error:
+        logger.error(f'POST /appointment - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+
+    finally:
+        if conn is not None:
+            conn.close()
+
+    return flask.jsonify(response)
+
+@app.route('/dbproj/appointments/<patient_user_id>', methods=['GET'])
+def see_appointments(patient_user_id):
+
+    logger.info('GET /appointments/<patient_user_id>')
+
+    logger.debug(f'patient_user_id: {patient_user_id}')
+
+
+    conn = db_connection()
+    cur = conn.cursor()
+
+    try:
+
+        headers = flask.request.headers
+        bearer = headers.get('Authorization')
+        token = bearer.split()[1]
+
+        print(token)
+
+        aut_token = decode_token(token)
+
+
+        #check if token is from an assistant or a patient
+
+        #check if patient
+        cur.execute("SELECT * FROM patient WHERE person_id = %s", (aut_token['user_id'],))
+        patient = cur.fetchone()
+
+        #check if assistant
+        cur.execute("SELECT * FROM assistant WHERE employee_person_id = %s", (aut_token['user_id'],))
+        assistant = cur.fetchone()
+
+
+        if not patient and not assistant:
+            if conn is not None:
+                conn.close()
+            return jsonify({'status': StatusCodes['unauthorized'], 'errors': 'User is not a patient nor an assistant'}), StatusCodes['unauthorized']
+
+
+
+        cur.execute('SELECT * FROM appointment WHERE patient_person_id = %s', (patient_user_id,))
+        rows = cur.fetchall()
+
+        logger.debug('GET /appointments/<patient_user_id>')
+
+        appointments = []
+        counter = 1
+        for row in rows:
+            logger.debug(row)
+            content = {
+                f'Appointment{counter}_id': row[0],
+                'Date': row[1],
+                'Patient_id': row[2],
+                f'Billing{counter}_id': row[3],
+                'Assistant_id': row[4],
+                'Doctor_id': row[5]
+            }
+            appointments.append(content)
+            counter += 1
+
+        response = {'status': StatusCodes['success'], 'results': appointments}
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        logger.error(f'GET /departments/<ndep> - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
 
     finally:
         if conn is not None:
