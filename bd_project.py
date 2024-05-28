@@ -282,16 +282,32 @@ def schedule_appointment():
 
     logger.debug(f'POST /appointment - payload: {payload}')
 
-       
-    # Validate payload
-    required_fields = ['doctor_id', 'assistant_id', 'date', 'token']
-    if not all(field in payload for field in required_fields):
-        response = {'status': StatusCodes['client_error'], 'results': 'values missing in payload'}
-        return flask.jsonify(response)
-
 
     try:
-        
+        # Validate authentication
+        headers = flask.request.headers
+        bearer = headers.get('Authorization')
+        token = bearer.split()[1]
+
+        aut_token = decode_token(token)
+       
+
+        #check if user is a patient
+        cur.execute("SELECT * FROM patient WHERE person_id = %s", (aut_token['user_id'],))
+        patient = cur.fetchone()
+        if not patient:
+            if conn is not None:
+                conn.close()
+            return jsonify({'status': StatusCodes['unauthorized'], 'errors': 'User is not a patient'}), StatusCodes['unauthorized']
+
+
+        # Validate payload
+        required_fields = ['doctor_id', 'assistant_id', 'date']
+        if not all(field in payload for field in required_fields):
+            response = {'status': StatusCodes['client_error'], 'results': 'values missing in payload'}
+            return flask.jsonify(response)
+
+
         #check if doctor exists
         cur.execute("SELECT * FROM doctor WHERE employee_person_id = %s", (payload['doctor_id'],))
         doctor = cur.fetchone()
@@ -309,20 +325,6 @@ def schedule_appointment():
                 conn.close()
             return jsonify({'status': StatusCodes['client_error'], 'errors': 'Assistant doesnt exist'}), StatusCodes['client_error']
 
-
-        aut_token = decode_token(payload['token'])
-
-        #check if user is a patient
-        cur.execute("SELECT * FROM patient WHERE person_id = %s", (aut_token['user_id'],))
-        patient = cur.fetchone()
-        if not patient:
-            if conn is not None:
-                conn.close()
-            return jsonify({'status': StatusCodes['unauthorized'], 'errors': 'User is not a patient'}), StatusCodes['unauthorized']
-
-
-        cur.execute('SELECT username FROM person WHERE id = %s;', (aut_token['user_id'],))
-        username = cur.fetchall()
 
         appointment_date = datetime.strptime(payload['date'], '%d-%m-%Y %H:%M:%S')
 
@@ -381,12 +383,10 @@ def see_appointments(patient_user_id):
     cur = conn.cursor()
 
     try:
-
+        # Validate authentication
         headers = flask.request.headers
         bearer = headers.get('Authorization')
         token = bearer.split()[1]
-
-        print(token)
 
         aut_token = decode_token(token)
 
@@ -441,7 +441,242 @@ def see_appointments(patient_user_id):
 
     return flask.jsonify(response)
 
+def confirm_new_surgery(conn, cur, aut_token, payload):
 
+
+    #check if user is an assistant
+    cur.execute("SELECT * FROM assistant WHERE employee_person_id = %s", (aut_token['user_id'],))
+    assistant = cur.fetchone()
+    if not assistant:
+        if conn is not None:
+            conn.close()
+        return 0
+
+    # Validate payload
+    required_fields = ['patient_id', 'doctor_id', 'nurses', 'date', 'room', 'field', 'description']
+    if not all(field in payload for field in required_fields):
+        return 1
+
+
+        
+    #check if patient exists
+    cur.execute("SELECT * FROM patient WHERE person_id = %s", (payload['patient_id'],))
+    patient = cur.fetchone()
+    if not patient:
+        if conn is not None:
+            conn.close()
+        return 2
+
+
+    #check if doctor exists
+    cur.execute("SELECT * FROM doctor WHERE employee_person_id = %s", (payload['doctor_id'],))
+    doctor = cur.fetchone()
+    if not doctor:
+        if conn is not None:
+            conn.close()
+        return 3
+
+
+    #check if nurses exists
+    for nurse in payload['nurses']:
+        cur.execute("SELECT * FROM nurse WHERE employee_person_id = %s", (nurse[0],))
+        temp_nurse = cur.fetchone()
+        if not temp_nurse:
+            if conn is not None:
+                conn.close()
+            return 4
+
+
+
+@app.route('/dbproj/surgery/', methods=['POST'])
+def schedule_surgery_new_hosp():
+
+    logger.info('POST /surgery')
+    payload = flask.request.get_json()
+
+    conn = db_connection()
+    cur = conn.cursor()
+
+    logger.debug(f'POST /surgery - payload: {payload}')
+
+    try:
+        # Validate authentication
+        headers = flask.request.headers
+        bearer = headers.get('Authorization')
+        token = bearer.split()[1]
+
+        aut_token = decode_token(token)
+
+        res = confirm_new_surgery(conn, cur, aut_token, payload)
+
+        if(res == 0):
+            return jsonify({'status': StatusCodes['unauthorized'], 'errors': 'User is not an assistant'}), StatusCodes['unauthorized']
+        elif(res == 1):
+            return jsonify({'status': StatusCodes['client_error'], 'results': 'Values missing in payload'},), StatusCodes['client_error']
+        elif(res == 2):
+            return jsonify({'status': StatusCodes['client_error'], 'errors': 'Patient doesnt exist'}), StatusCodes['client_error']
+        elif(res == 3):
+            return jsonify({'status': StatusCodes['client_error'], 'errors': 'Doctor doesnt exist'}), StatusCodes['client_error']
+        elif(res == 4):
+            return jsonify({'status': StatusCodes['client_error'], 'errors': 'Invalid nurse'}), StatusCodes['client_error']
+
+
+
+        surgery_date = datetime.strptime(payload['date'], '%d-%m-%Y %H:%M:%S')
+
+        # Generate a unique surgery_id, hosp_id and bill_id
+        surgery_id = str(uuid.uuid4())
+
+        hosp_id = str(uuid.uuid4())
+
+        bill_id = str(uuid.uuid4())
+
+        hosp_statement = ''' 
+            INSERT INTO hospitalization (id, hosp_date, time_hosp, patient_person_id, billing_id, assistant_employee_person_id, nurse_employee_person_id) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        '''
+
+        nurses = payload['nurses']
+        nurse = nurses[0]
+  
+        hosp_values = (hosp_id, surgery_date, surgery_date, payload['patient_id'], bill_id, aut_token['user_id'], nurse[0],)
+        
+        cur.execute(hosp_statement, hosp_values)
+
+        surgery_statement = '''
+            INSERT INTO surgery (id, surg_date, room, patient_person_id, doctor_employee_person_id, hospitalization_id, field, description)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        '''
+
+        surgery_values = (surgery_id, surgery_date, payload['room'], payload['patient_id'], payload['doctor_id'], hosp_id, payload['field'], payload['description'])
+
+        cur.execute(surgery_statement, surgery_values)
+        conn.commit()
+
+        response = {'status': StatusCodes['success'], 'results': {'hospitalization_id': hosp_id, 'surgery_id': surgery_id, 'patient_id': payload['patient_id'], 'doctor_id': payload['doctor_id'], 'date': surgery_date}}
+        return jsonify(response), StatusCodes['success']
+
+    except jwt.exceptions.InvalidTokenError as error:
+
+        logger.error(f'POST /surgery - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+
+    
+    except ValueError:
+            return jsonify({'status': StatusCodes['client_error'], 'errors': 'Invalid date format. Use DD-MM-YYYY HH:MM:SS'}), StatusCodes['client_error']
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        logger.error(f'POST /surgery - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+
+        conn.rollback()
+
+    except Exception as error:
+        logger.error(f'POST /surgery - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+
+    finally:
+        if conn is not None:
+            conn.close()
+
+    return flask.jsonify(response)
+
+
+
+@app.route('/dbproj/surgery/<hospitalization_id>', methods=['POST'])
+def schedule_surgery(hospitalization_id):
+
+    logger.info('POST /surgery/<hospitalization_id>')
+    payload = flask.request.get_json()
+
+    conn = db_connection()
+    cur = conn.cursor()
+
+    logger.debug(f'POST /surgery/<hospitalization_id> - payload: {payload}')
+
+    try:
+        # Validate authentication
+        headers = flask.request.headers
+        bearer = headers.get('Authorization')
+        token = bearer.split()[1]
+
+        aut_token = decode_token(token)
+
+        res = confirm_new_surgery(conn, cur, aut_token, payload)
+
+        if(res == 0):
+            return jsonify({'status': StatusCodes['unauthorized'], 'errors': 'User is not an assistant'}), StatusCodes['unauthorized']
+        elif(res == 1):
+            return jsonify({'status': StatusCodes['client_error'], 'results': 'Values missing in payload'},), StatusCodes['client_error']
+        elif(res == 2):
+            return jsonify({'status': StatusCodes['client_error'], 'errors': 'Patient doesnt exist'}), StatusCodes['client_error']
+        elif(res == 3):
+            return jsonify({'status': StatusCodes['client_error'], 'errors': 'Doctor doesnt exist'}), StatusCodes['client_error']
+        elif(res == 4):
+            return jsonify({'status': StatusCodes['client_error'], 'errors': 'Invalid nurse'}), StatusCodes['client_error']
+
+
+        # Check if hospitalization exists
+        cur.execute("SELECT * FROM hospitalization WHERE id = %s", (hospitalization_id,))
+        hospitalization = cur.fetchone()
+        if not hospitalization:
+            if conn is not None:
+                conn.close()
+            return jsonify({'status': StatusCodes['client_error'], 'errors': 'Hospitalization not found'}), StatusCodes['client_error']
+
+        # Check if hospitalization is from the patient input
+
+        cur.execute("SELECT patient_person_id FROM hospitalization WHERE id = %s", (hospitalization_id,))
+        patient_id_row = cur.fetchone()
+
+        if patient_id_row is not None:
+            if payload['patient_id'] != patient_id_row[0]:
+                if conn is not None:
+                    conn.close()
+                return jsonify({'status': StatusCodes['client_error'], 'errors': f'Different patients. Patient Hospitalized: {patient_id}. Input Patient: {payload['patient_id']}'}), StatusCodes['client_error']
+
+        surgery_date = datetime.strptime(payload['date'], '%d-%m-%Y %H:%M:%S')
+
+        # Generate a unique surgery_id, hosp_id and bill_id
+        surgery_id = str(uuid.uuid4())
+
+        surgery_statement = '''
+            INSERT INTO surgery (id, surg_date, room, patient_person_id, doctor_employee_person_id, hospitalization_id, field, description)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        '''
+
+        surgery_values = (surgery_id, surgery_date, payload['room'], payload['patient_id'], payload['doctor_id'], hospitalization_id, payload['field'], payload['description'])
+
+        cur.execute(surgery_statement, surgery_values)
+        conn.commit()
+
+        response = {'status': StatusCodes['success'], 'results': {'hospitalization_id': hospitalization_id, 'surgery_id': surgery_id, 'patient_id': payload['patient_id'], 'doctor_id': payload['doctor_id'], 'date': surgery_date}}
+        return jsonify(response), StatusCodes['success']
+
+    except jwt.exceptions.InvalidTokenError as error:
+
+        logger.error(f'POST /surgery/<hospitalization_id> - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+
+    
+    except ValueError:
+            return jsonify({'status': StatusCodes['client_error'], 'errors': 'Invalid date format. Use DD-MM-YYYY HH:MM:SS'}), StatusCodes['client_error']
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        logger.error(f'POST /surgery/<hospitalization_id> - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+
+        conn.rollback()
+
+    except Exception as error:
+        logger.error(f'POST /surgery/<hospitalization_id> - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+
+    finally:
+        if conn is not None:
+            conn.close()
+
+    return flask.jsonify(response)
 
 if __name__ == '__main__':
 
