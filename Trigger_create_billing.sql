@@ -2,7 +2,7 @@ CREATE OR REPLACE FUNCTION create_billing_entry()
 RETURNS TRIGGER AS $$
 BEGIN
     
-    INSERT INTO billing (id, price) VALUES (NEW.billing_id, 20);
+    INSERT INTO billing (id, cost) VALUES (NEW.billing_id, 20);
     
     RETURN NEW;
 END;
