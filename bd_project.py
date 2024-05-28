@@ -15,6 +15,7 @@ app = flask.Flask(__name__)
 
 StatusCodes = {
     'success': 200,
+    'no_content': 204,
     'client_error': 400,
     'unauthorized': 401,
     'internal_error': 500
@@ -412,7 +413,7 @@ def see_appointments(patient_user_id):
         cur.execute('SELECT * FROM appointment WHERE patient_person_id = %s', (patient_user_id,))
         rows = cur.fetchall()
 
-        logger.debug('GET /appointments/<patient_user_id>')
+        logger.debug('GET /appointments/<patient_user_id>/')
 
         appointments = []
         counter = 1
@@ -432,7 +433,7 @@ def see_appointments(patient_user_id):
         response = {'status': StatusCodes['success'], 'results': appointments}
 
     except (Exception, psycopg2.DatabaseError) as error:
-        logger.error(f'GET /departments/<ndep> - error: {error}')
+        logger.error(f'GET /appointments/<patient_user_id>/ - error: {error}')
         response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
 
     finally:
@@ -615,7 +616,7 @@ def schedule_surgery(hospitalization_id):
         elif(res == 4):
             return jsonify({'status': StatusCodes['client_error'], 'errors': 'Invalid nurse'}), StatusCodes['client_error']
 
-
+    
         # Check if hospitalization exists
         cur.execute("SELECT * FROM hospitalization WHERE id = %s", (hospitalization_id,))
         hospitalization = cur.fetchone()
@@ -677,6 +678,240 @@ def schedule_surgery(hospitalization_id):
             conn.close()
 
     return flask.jsonify(response)
+
+
+@app.route('/dbproj/prescription/', methods=['POST'])
+def add_prescription():
+
+    logger.info('POST /prescription/')
+    payload = flask.request.get_json()
+
+    conn = db_connection()
+    cur = conn.cursor()
+
+    logger.debug(f'POST /prescription/ - payload: {payload}')
+
+
+    try:
+        # Validate authentication
+        headers = flask.request.headers
+        bearer = headers.get('Authorization')
+        token = bearer.split()[1]
+
+        aut_token = decode_token(token)
+       
+
+        #check if user is a doctor
+        cur.execute("SELECT * FROM doctor WHERE employee_person_id = %s", (aut_token['user_id'],))
+        doctor = cur.fetchone()
+        if not doctor:
+            if conn is not None:
+                conn.close()
+            return jsonify({'status': StatusCodes['unauthorized'], 'errors': 'User is not a doctor'}), StatusCodes['unauthorized']
+
+        
+        # Validate payload
+        required_fields = ['type', 'event_id', 'validity', 'medicines']
+        if not all(field in payload for field in required_fields):
+            response = {'status': StatusCodes['client_error'], 'results': 'values missing in payload'}
+            return flask.jsonify(response)
+
+
+        if payload['type'] == 'appointment':
+        
+            cur.execute('SELECT * FROM appointment WHERE id = %s', (payload['event_id'],))
+            appointment = cur.fetchone()
+            
+            if not appointment:
+                if conn is not None:
+                    conn.close()
+                return jsonify({'status': StatusCodes['unauthorized'], 'errors': 'Invalid appointment'}), StatusCodes['unauthorized']
+        
+        elif payload['type'] == 'hospitalization':
+
+            cur.execute('SELECT * FROM hospitalization WHERE id = %s', (payload['event_id'],))
+            hosp = cur.fetchone()
+
+            if not hosp:
+                if conn is not None:
+                    conn.close()
+                return jsonify({'status': StatusCodes['unauthorized'], 'errors': 'Invalid hospitalization'}), StatusCodes['unauthorized']
+                
+        else:
+            if conn is not None:
+                    conn.close()
+            return jsonify({'status': StatusCodes['unauthorized'], 'errors': 'Invalid type'}), StatusCodes['unauthorized']
+
+        
+        prescription_date = datetime.strptime(payload['validity'], '%d-%m-%Y')
+
+        # Generate a unique prescription_id
+        prescription_id = str(uuid.uuid4())
+
+        prescription_statement = '''
+            INSERT INTO prescription (id, type, event_id, validity)
+            VALUES (%s, %s, %s, %s)
+        '''
+        prescription_values = (prescription_id, payload['type'], payload['event_id'], prescription_date,)
+        
+
+        cur.execute(prescription_statement, prescription_values)
+
+        if payload['type'] == 'appointment':
+            cur.execute('INSERT INTO prescription_appointment (prescription_id, appointment_id) VALUES(%s, %s)', 
+                            (prescription_id, payload['event_id']))
+        else: #hospitalization
+            cur.execute('INSERT INTO hospitalization_prescription (hospitalization_id, prescription_id) VALUES(%s, %s)', 
+                            (payload['event_id'], prescription_id))
+
+        for med in payload['medicines']:
+
+            # Check if the medicine with the same name and dose already exists in the Medicine table
+            cur.execute('SELECT id FROM medicine WHERE name = %s AND dose = %s', (med['medicine'], med['posology_dose']))
+            medicine = cur.fetchone()
+            
+            if not medicine:
+                medicine_id = str(uuid.uuid4())
+                cur.execute('INSERT INTO medicine (id, name, dose) VALUES (%s, %s, %s)', 
+                            (medicine_id, med['medicine'], med['posology_dose']))
+
+            else:
+                medicine_id = medicine[0]
+            
+            cur.execute('INSERT INTO prescriptionmed (dosage, frequency, medicine_id, prescription_id) VALUES (%s, %s, %s, %s)', 
+                       (med['posology_dose'], med['posology_frequency'], medicine_id, prescription_id))
+
+
+        conn.commit()
+
+        response = {'status': StatusCodes['success'], 'results': {'prescription_id': prescription_id}}
+        return jsonify(response), StatusCodes['success']
+
+    except jwt.exceptions.InvalidTokenError as error:
+
+        logger.error(f'POST /prescription/ - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+
+    
+    except ValueError:
+            logger.error(f'POST /prescription/ - error: {error}')
+            response ={'status': StatusCodes['client_error'], 'errors': 'Invalid date format. Use DD-MM-YYYY', 'errors': str(error)}
+            conn.rollback()
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        logger.error(f'POST /prescription/ - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+
+        conn.rollback()
+
+    except Exception as error:
+        logger.error(f'POST /prescription/ - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+        conn.rollback()
+
+    finally:
+        if conn is not None:
+            conn.close()
+
+    return flask.jsonify(response)
+
+
+@app.route('/dbproj/prescriptions/<person_id>/', methods=['GET'])
+def get_precriptions(person_id):
+
+    logger.info('GET /prescription/<person_id>/')
+
+    logger.debug(f'person_id: {person_id}')
+
+
+    conn = db_connection()
+    cur = conn.cursor()
+
+    try:
+        # Validate authentication
+        headers = flask.request.headers
+        bearer = headers.get('Authorization')
+        token = bearer.split()[1]
+
+        aut_token = decode_token(token)
+
+        #check if employee or target patient
+
+        cur.execute("SELECT * FROM employee WHERE person_id = %s", (aut_token['user_id'],))
+        employee = cur.fetchone()
+
+        if aut_token['user_id'] != person_id and employee is None:
+            if conn is not None:
+                conn.close()
+            return jsonify({'status': StatusCodes['unauthorized'], 'errors': 'User is not the target patient nor an employee'}), StatusCodes['unauthorized']
+
+
+        cur.execute('SELECT prescription_id FROM prescription_patient WHERE patient_person_id = %s', (person_id,))
+        prescription_ids = cur.fetchall()
+
+        if not prescription_ids:
+            if conn is not None:
+                conn.close()
+            return jsonify({'status': StatusCodes['no_content'], 'result': 'User has no prescription'}), StatusCodes['no_content']
+        
+
+
+        results = []
+        logger.debug('GET /prescriptions/<person_id>/')
+
+        for presc_id_tuple in prescription_ids:
+            presc_id = presc_id_tuple[0]
+
+            cur.execute('SELECT * FROM prescription WHERE id = %s', (presc_id,))
+            prescription = cur.fetchone()
+
+            if not prescription:
+                continue
+
+            cur.execute('SELECT * FROM prescriptionmed WHERE prescription_id = %s', (presc_id,))
+            prescription_meds = cur.fetchall()
+
+            posology = []
+            for presc_med in prescription_meds:
+                cur.execute('SELECT name FROM medicine WHERE id = %s', (presc_med[2],))
+                med_name = cur.fetchone()
+
+                if med_name:
+                    posology.append({
+                        'Dose': presc_med[0],
+                        'Frequency': presc_med[1],
+                        'Medicine': med_name[0]
+                    })
+
+            result = {
+                'id': prescription[0],
+                'validity': prescription[3],
+                'posology': posology
+            }
+            results.append(result)
+
+        response = {'status': StatusCodes['success'], 'results': results}
+
+
+    except jwt.exceptions.InvalidTokenError as error:
+
+        logger.error(f'GET /prescription/<person_id>/ - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        logger.error(f'GET /prescription/<person_id>/ - error: {error}')
+        response = {'status': StatusCodes['internal_error'], 'errors': str(error)}
+        conn.rollback()
+
+    finally:
+        if conn is not None:
+            conn.close()
+
+    return flask.jsonify(response)
+
+
+
 
 if __name__ == '__main__':
 
